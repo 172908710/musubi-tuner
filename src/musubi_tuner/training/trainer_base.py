@@ -17,7 +17,7 @@ import sys
 import random
 import time
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from multiprocessing import Value
 from typing import Any, List, Optional
 import accelerate
@@ -84,6 +84,67 @@ SS_METADATA_MINIMUM_KEYS = [
 ]
 
 
+TRAINING_STATE_VERSION = 1
+
+
+@dataclass
+class TrainingState:
+    global_step: int = 0
+    epoch: int = 0
+    batch_index: int = 0
+    dataloader_config: Optional[dict] = None
+    timestep_range_pool: list = field(default_factory=list)
+
+    def state_dict(self):
+        return {"version": TRAINING_STATE_VERSION, **asdict(self)}
+
+    @staticmethod
+    def _config(length, accumulation, processes, split_batches, seed, num_timestep_buckets):
+        return {
+            "prepared_len": int(length),
+            "gradient_accumulation_steps": int(accumulation),
+            "num_processes": int(processes),
+            "split_batches": bool(split_batches),
+            "seed": seed,
+            "num_timestep_buckets": num_timestep_buckets,
+        }
+
+    def configure(self, *config):
+        self.dataloader_config = self._config(*config)
+
+    def validate(self, *config):
+        length, accumulation = config[:2]
+        current = self._config(*config)
+        if not isinstance(self.dataloader_config, dict) or self.dataloader_config != current:
+            raise ValueError(f"dataloader configuration mismatch: {self.dataloader_config} != {current}")
+        batch_index, epoch = self.batch_index, self.epoch
+        if not 0 <= batch_index <= length or (batch_index != length and batch_index % accumulation):
+            raise ValueError(f"invalid batch cursor {batch_index} for length {length} and accumulation {accumulation}")
+        if batch_index == length:
+            epoch, batch_index = epoch + 1, 0
+        steps_per_epoch = math.ceil(length / accumulation)
+        expected_step = epoch * steps_per_epoch + batch_index // accumulation
+        if self.global_step != expected_step:
+            raise ValueError(
+                f"training cursor is inconsistent: global_step={self.global_step}, "
+                f"epoch={epoch}, batch_index={batch_index}, expected={expected_step}"
+            )
+
+    def load_state_dict(self, state):
+        required = {"version", "global_step", "epoch", "batch_index", "dataloader_config"}
+        missing = required.difference(state)
+        if missing:
+            raise ValueError(f"Training state is missing fields: {sorted(missing)}")
+        if state["version"] != TRAINING_STATE_VERSION:
+            raise ValueError(f"Unsupported training state version: {state['version']}")
+        if any(type(state[key]) is not int or state[key] < 0 for key in ("global_step", "epoch", "batch_index")):
+            raise ValueError(f"invalid counters in training state: {state}")
+        self.global_step, self.epoch, self.batch_index = (state[key] for key in ("global_step", "epoch", "batch_index"))
+        self.dataloader_config = dict(state["dataloader_config"])
+        self.dataloader_config.setdefault("num_timestep_buckets", None)
+        self.timestep_range_pool = list(state.get("timestep_range_pool", []))
+
+
 @dataclass
 class DiTOutput:
     """Return type for ``NetworkTrainer.call_dit``.
@@ -102,6 +163,8 @@ class DiTOutput:
 class NetworkTrainer:
     def __init__(self):
         self.blocks_to_swap = None
+        self._training_state = TrainingState()
+        self._resumed_from_state = False
         self.timestep_range_pool = []
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
@@ -1444,7 +1507,18 @@ class NetworkTrainer:
         training_started_at = time.time()
         # setup_logging(args, reset=True)
 
+        if args.seed is None and args.resume and not args.resume_from_huggingface:
+            state_path = os.path.join(args.resume, "trainer_state.pt")
+            if os.path.isfile(state_path):
+                state = torch.load(state_path, map_location="cpu", weights_only=True)
+                saved_seed = state.get("dataloader_config", {}).get("seed")
+                if isinstance(saved_seed, int):
+                    args.seed = saved_seed
         if args.seed is None:
+            if args.resume and args.resume_from_huggingface:
+                raise ValueError(
+                    "--resume_from_huggingface requires --seed because the checkpoint seed must be known before dataset setup"
+                )
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
         return session_id, training_started_at
@@ -1731,6 +1805,8 @@ class NetworkTrainer:
             transformer = self.compile_transformer(args, transformer)
             transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
 
+        accelerator.dataloader_config.use_seedable_sampler = True
+        accelerator.dataloader_config.data_seed = args.seed
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
         training_model = network
 
@@ -1753,36 +1829,67 @@ class NetworkTrainer:
 
         return transformer, network, optimizer, train_dataloader, lr_scheduler, training_model, network_dtype
 
+    def _training_config(self, args, accelerator, train_dataloader):
+        return (
+            len(train_dataloader),
+            args.gradient_accumulation_steps,
+            accelerator.num_processes,
+            accelerator.split_batches,
+            args.seed,
+            args.num_timestep_buckets,
+        )
+
+    def _restore_training_progress(self, args, accelerator, lr_scheduler, train_dataloader):
+        state = self._training_state
+        config = self._training_config(args, accelerator, train_dataloader)
+        if state.dataloader_config is not None:
+            state.validate(*config)
+        else:
+            scheduler_step = getattr(lr_scheduler, "last_epoch", None)
+            if scheduler_step is None and hasattr(lr_scheduler, "state_dict"):
+                scheduler_step = lr_scheduler.state_dict().get("last_epoch")
+            if type(scheduler_step) is not int or scheduler_step < 0:
+                raise ValueError("Legacy resume state has no usable scheduler progress or training state")
+            ticks = 1 if accelerator.split_batches else accelerator.num_processes
+            state.global_step = scheduler_step // ticks
+            per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+            state.epoch, steps_in_epoch = divmod(state.global_step, per_epoch)
+            state.batch_index = steps_in_epoch * args.gradient_accumulation_steps
+            if state.batch_index >= len(train_dataloader):
+                state.epoch, state.batch_index = state.epoch + 1, 0
+            state.configure(*config)
+            logger.warning("Legacy state: inferred step %s; exact mid-epoch order cannot be recovered.", state.global_step)
+        return state.global_step, state.epoch, state.batch_index
+
     def _register_hooks_and_resume(self, args, accelerator, network):
-        # before resuming make hook for saving/loading to save/load the network weights only
+        network_type = type(accelerator.unwrap_model(network))
+
+        def remove_other_models(models, weights=None):
+            target = models if weights is None else weights
+            for i in reversed([i for i, model in enumerate(models) if not isinstance(model, network_type)]):
+                if i < len(target):
+                    target.pop(i)
+
         def save_model_hook(models, weights, output_dir):
-            # pop weights of other models than network to save only network weights
-            # only main process or deepspeed https://github.com/huggingface/diffusers/issues/2606
-            if accelerator.is_main_process:  # or args.deepspeed:
-                remove_indices = []
-                for i, model in enumerate(models):
-                    if not isinstance(model, type(accelerator.unwrap_model(network))):
-                        remove_indices.append(i)
-                for i in reversed(remove_indices):
-                    if len(weights) > i:
-                        weights.pop(i)
-                # print(f"save model hook: {len(weights)} weights will be saved")
+            self._training_state.timestep_range_pool = list(self.timestep_range_pool)
+            accelerator.save(self._training_state.state_dict(), os.path.join(output_dir, "trainer_state.pt"))
+            if accelerator.is_main_process:
+                remove_other_models(models, weights)
 
         def load_model_hook(models, input_dir):
-            # remove models except network
-            remove_indices = []
-            for i, model in enumerate(models):
-                if not isinstance(model, type(accelerator.unwrap_model(network))):
-                    remove_indices.append(i)
-            for i in reversed(remove_indices):
-                models.pop(i)
-            # print(f"load model hook: {len(models)} models will be loaded")
+            state_path = os.path.join(input_dir, "trainer_state.pt")
+            if os.path.isfile(state_path):
+                self._training_state.load_state_dict(torch.load(state_path, map_location="cpu", weights_only=True))
+                self.timestep_range_pool = list(self._training_state.timestep_range_pool)
+            remove_other_models(models)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-        # resume from local or huggingface. accelerator.step is set
-        self.resume_from_local_or_hf_if_specified(accelerator, args)  # accelerator.load_state(args.resume)
+        # Resume from local or Hugging Face state after registering all state objects.
+        self._resumed_from_state = self.resume_from_local_or_hf_if_specified(
+            accelerator, args
+        )  # accelerator.load_state(args.resume)
 
     def _run_training_loop(
         self,
@@ -1936,11 +2043,29 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        training_state = self._training_state
+        if self._resumed_from_state:
+            global_step, epoch_to_start, resume_step_in_epoch = self._restore_training_progress(
+                args, accelerator, lr_scheduler, train_dataloader
+            )
+            logger.info(f"Resuming training from step {global_step}")
+        else:
+            global_step, epoch_to_start, resume_step_in_epoch = 0, 0, 0
+            training_state.configure(*self._training_config(args, accelerator, train_dataloader))
 
-        epoch_to_start = 0
-        global_step = 0
+        if global_step >= args.max_train_steps:
+            logger.info("Resume state is already at or beyond max_train_steps; no training steps remain.")
+            accelerator.end_training()
+            return
+
+        progress_bar = tqdm(
+            range(args.max_train_steps),
+            initial=global_step,
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
+
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
@@ -2015,12 +2140,12 @@ class NetworkTrainer:
                     accelerator, args, epoch_arg, steps_arg, vae, transformer, network, sample_parameters, dit_dtype
                 )
 
-        # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        # For --sample_at_first. Do not repeat the initial sample after resume.
+        if not self._resumed_from_state and should_sample_images(args, global_step, epoch=0):
             optimizer_eval_fn()
             _do_sample(0, global_step)
             optimizer_train_fn()
-        if len(accelerator.trackers) > 0:
+        if len(accelerator.trackers) > 0 and not self._resumed_from_state:
             # log empty object to commit the sample images to wandb
             accelerator.log({}, step=0)
 
@@ -2038,14 +2163,31 @@ class NetworkTrainer:
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
+            if global_step >= args.max_train_steps:
+                break
+
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
             metadata["ss_epoch"] = str(epoch + 1)
 
+            train_dataloader.set_epoch(epoch)
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
-            for step, batch in enumerate(train_dataloader):
+            epoch_dataloader = train_dataloader
+            if epoch == epoch_to_start and resume_step_in_epoch > 0:
+                epoch_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step_in_epoch)
+                logger.info("Resuming at batch %s of epoch %s", resume_step_in_epoch, epoch + 1)
+            epoch_iterator = iter(epoch_dataloader)
+            for step in range(
+                resume_step_in_epoch if epoch == epoch_to_start else 0,
+                len(train_dataloader),
+            ):
+                rng_state = (random.getstate(), np.random.get_state(), torch.get_rng_state())
+                batch = next(epoch_iterator)
+                random.setstate(rng_state[0])
+                np.random.set_state(rng_state[1])
+                torch.set_rng_state(rng_state[2])
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = batch["latents"]
@@ -2110,6 +2252,9 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    training_state.global_step, training_state.epoch, training_state.batch_index = global_step, epoch, step + 1
+                    if step + 1 == len(train_dataloader):
+                        training_state.epoch, training_state.batch_index = epoch + 1, 0
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -2126,9 +2271,10 @@ class NetworkTrainer:
                                 ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
-                                if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                            if args.save_state:
+                                train_utils.save_and_remove_state_stepwise(args, accelerator, global_step, sync_processes=True)
 
+                            if accelerator.is_main_process:
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
@@ -2166,7 +2312,9 @@ class NetworkTrainer:
             optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
-                if is_main_process and saving:
+                if saving and args.save_state:
+                    train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1, sync_processes=True)
+                if saving and is_main_process:
                     ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
                     save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
 
@@ -2174,9 +2322,6 @@ class NetworkTrainer:
                     if remove_epoch_no is not None:
                         remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
                         remove_model(remove_ckpt_name)
-
-                    if args.save_state:
-                        train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             _do_sample(epoch + 1, global_step)
             optimizer_train_fn()
@@ -2189,14 +2334,14 @@ class NetworkTrainer:
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
-        accelerator.end_training()
         optimizer_eval_fn()
-
-        if is_main_process and (args.save_state or args.save_state_on_train_end):
-            train_utils.save_state_on_train_end(args, accelerator)
+        if args.save_state or args.save_state_on_train_end:
+            train_utils.save_state_on_train_end(args, accelerator, sync_processes=True)
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
 
             logger.info("model saved.")
+
+        accelerator.end_training()
