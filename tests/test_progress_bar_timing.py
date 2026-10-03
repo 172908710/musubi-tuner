@@ -80,6 +80,28 @@ def test_disabled_progress_bar_is_unchanged():
     assert progress_bar.total == 10
 
 
+@pytest.mark.parametrize("initial_step", [0, 1, 100])
+def test_resumed_first_step_resets_timing_without_losing_progress(initial_step):
+    progress_bar, clock, _ = make_progress_bar()
+    try:
+        progress_bar.total = initial_step + 10
+        progress_bar.initial = initial_step
+        progress_bar.n = initial_step
+        progress_bar.last_print_n = initial_step
+        clock.value = 10.0
+        progress_bar.update(1)
+        train_utils.reset_progress_bar_timing(progress_bar)
+
+        assert progress_bar.n == initial_step + 1
+        assert progress_bar.initial == initial_step + 1
+        assert progress_bar.format_dict["elapsed"] == 0
+        clock.value = 14.0
+        progress_bar.update(1)
+        assert "4.00s/it" in tqdm.format_meter(**progress_bar.format_dict)
+    finally:
+        progress_bar.close()
+
+
 def test_all_training_loops_reset_after_first_synchronized_loss():
     source_root = Path(__file__).resolve().parents[1] / "src" / "musubi_tuner"
     training_files = (
@@ -98,5 +120,6 @@ def test_all_training_loops_reset_after_first_synchronized_loss():
         reset = source.index("train_utils.reset_progress_bar_timing(progress_bar)", synchronized_loss)
 
         assert update < increment < synchronized_loss < reset, path
-        assert "if accelerator.sync_gradients and global_step == 1:" in source[increment:reset]
+        expected_step = "initial_global_step + 1" if path.name == "trainer_base.py" else "1"
+        assert f"if accelerator.sync_gradients and global_step == {expected_step}:" in source[increment:reset]
         assert "progress_bar.reset()" not in source
