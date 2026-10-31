@@ -229,13 +229,19 @@ def test_build_network_eagerly_builds_turbo_lora(tiny_k2_model, tmp_path, monkey
     lora_path = tmp_path / "turbo_lora.safetensors"
     save_file(trainee.state_dict(), str(lora_path))
 
-    monkeypatch.setattr(NetworkTrainer, "_build_network", lambda self, args, accelerator, transformer, vae, weight_dtype: trainee)
+    train_dataset_group = object()
+
+    def build_network(self, args, accelerator, transformer, vae, weight_dtype, dataset_group):
+        assert dataset_group is train_dataset_group
+        return trainee
+
+    monkeypatch.setattr(NetworkTrainer, "_build_network", build_network)
 
     trainer = Krea2NetworkTrainer()
     args = _trainer_args(turbo_lora=str(lora_path), compile=True)
     accelerator = _FakeAccelerator()
 
-    result = trainer._build_network(args, accelerator, model, None, torch.float32)
+    result = trainer._build_network(args, accelerator, model, None, torch.float32, train_dataset_group)
 
     assert result is trainee
     assert trainer._turbo_lora_network is not None
@@ -244,22 +250,33 @@ def test_build_network_eagerly_builds_turbo_lora(tiny_k2_model, tmp_path, monkey
         assert "_orig_mod" not in lora.lora_name
 
 
-def test_build_network_skips_turbo_lora_when_not_set(tiny_k2_model, monkeypatch):
+@pytest.mark.parametrize(
+    ("network", "turbo_lora"), [("stub-network", None), (None, None), (None, "turbo_lora.safetensors")]
+)
+def test_build_network_skips_turbo_lora_when_not_needed(tiny_k2_model, monkeypatch, network, turbo_lora):
     from musubi_tuner.krea2_train_network import Krea2NetworkTrainer
     from musubi_tuner.training.trainer_base import NetworkTrainer
 
     model = tiny_k2_model
-    monkeypatch.setattr(
-        NetworkTrainer, "_build_network", lambda self, args, accelerator, transformer, vae, weight_dtype: "stub-network"
-    )
+    train_dataset_group = object()
+
+    def build_network(self, args, accelerator, transformer, vae, weight_dtype, dataset_group):
+        assert dataset_group is train_dataset_group
+        return network
+
+    def unexpected_turbo_build(*args, **kwargs):
+        pytest.fail("Turbo LoRA should not be built without both a trainee network and a Turbo LoRA path")
+
+    monkeypatch.setattr(NetworkTrainer, "_build_network", build_network)
+    monkeypatch.setattr(Krea2NetworkTrainer, "_build_turbo_lora_network", unexpected_turbo_build)
 
     trainer = Krea2NetworkTrainer()
-    args = _trainer_args(turbo_lora=None)
+    args = _trainer_args(turbo_lora=turbo_lora)
     accelerator = _FakeAccelerator()
 
-    result = trainer._build_network(args, accelerator, model, None, torch.float32)
+    result = trainer._build_network(args, accelerator, model, None, torch.float32, train_dataset_group)
 
-    assert result == "stub-network"
+    assert result is network
     assert trainer._turbo_lora_network is None
 
 
